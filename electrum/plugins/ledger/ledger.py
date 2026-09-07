@@ -36,6 +36,7 @@ from ..hw_wallet.plugin import (
     is_any_tx_output_on_change_branch,
     validate_op_return_output,
     LibraryFoundButUnusable,
+    StorageEncryptionUnavailable,
 )
 
 
@@ -83,6 +84,43 @@ MULTI_OUTPUT_SUPPORT = "1.1.4"
 SEGWIT_SUPPORT = "1.1.10"
 SEGWIT_SUPPORT_SPECIAL = "1.0.4"
 SEGWIT_TRUSTEDINPUTS = "1.4.0"
+
+# APDUs of the "legacy" ledger app (github.com/LedgerHQ/app-bitcoin-legacy),
+# which is what the "Ravencoin" app is built from.
+BTCHIP_CLA = 0xE0
+LEGACY_APP_NAME = "Ravencoin"  # ledger app speaking the legacy protocol
+NEW_APP_NAME = "Bitcoin"  # ledger app speaking the new protocol
+BTCHIP_INS_GET_MASTER_FINGERPRINT = 0xD0  # added in app version 2.4.11
+# status word the app returns when the OS refuses to derive a bip32 path
+SW_TECHNICAL_PROBLEM = 0x6F00
+# the device is locked (screensaver / pin not entered)
+SW_DEVICE_LOCKED = 0x5515
+# status words that mean "this app does not know that instruction"
+SW_UNKNOWN_INSTRUCTION = (0x6D00, 0x6E00, 0x6B00, 0x6A86)
+
+
+def msg_derivation_refused(bip32_path: str) -> str:
+    """Error message for SW 0x6F00 from the legacy app.
+
+    Since app version 2.4.10 ("derivation path hardening"), the bitcoin-fork apps
+    dropped APPLICATION_FLAG_DERIVE_MASTER and only declare "m/*/<coin_type>'" as
+    allowed derivation prefix, so the OS refuses anything else and the app answers
+    0x6F00. See the 2.4.10 entry in the app's CHANGELOG.
+    """
+    # note: _() rewrites "Bitcoin" to "Ravencoin", so app names go in via format()
+    path = ("m/" + bip32_path if bip32_path else "m").replace("h", "'")
+    return (
+        _('The Ledger app refused to derive the key at "{}".').format(path)
+        + "\n\n"
+        + _(
+            "Since app version 2.4.10, the {app} app only allows derivation paths of "
+            "the form m/*/{coin}' and no longer allows deriving the master key."
+        ).format(app=LEGACY_APP_NAME, coin=constants.net.BIP44_COIN_TYPE)
+        + " "
+        + _(
+            "Please update the {} app on your device to version 2.4.11 or newer."
+        ).format(LEGACY_APP_NAME)
+    )
 
 
 def is_policy_standard(wp: "WalletPolicy", fpr: bytes, exp_coin_type: int) -> bool:
@@ -341,25 +379,31 @@ class Ledger_Client(HardwareClientBase, ABC):
 
         transport = ledger_bitcoin.TransportClient("hid", hid=hid_device)
 
+        # Pick the protocol from the app that is currently running on the device.
+        # Only Ledger's "Bitcoin" app (>=2.1) speaks the new protocol; the "Ravencoin"
+        # app is built from the legacy app (app-bitcoin-legacy) and only understands
+        # the old btchip protocol, even though it reports a 2.4.x version number.
+        # ledger_bitcoin.createClient() only looks at the version, so it hands us a
+        # NewClient for the Ravencoin app, and every command then fails with 0x6E00.
+        use_new_client = False
         try:
-            cl = ledger_bitcoin.createClient(transport, chain=get_chain())
-
-            # This will fail for RVN but not for BTC
-            cl.get_master_fingerprint()
-        except (
-            ledger_bitcoin.exception.errors.InsNotSupportedError,
-            ledger_bitcoin.exception.errors.ClaNotSupportedError,
-        ) as e:
-            # This can happen on very old versions.
+            app_name, app_version, _flags = ledger_bitcoin.Client(
+                transport, get_chain()
+            ).get_version()
+            _logger.info(f"ledger app: {app_name!r}, version {app_version!r}")
+            use_new_client = app_name in (NEW_APP_NAME, f"{NEW_APP_NAME} Test")
+            try:
+                use_new_client = use_new_client and versiontuple(app_version) >= (2, 1)
+            except ValueError:
+                pass  # unparsable version string: assume a recent app
+        except Exception as e:
+            # GET_VERSION (cla 0xB0) is not answered by very old firmwares.
             # E.g. with a "nano s", with bitcoin app 1.1.10, SE 1.3.1, MCU 1.0,
             #      - on machine one, ghost43 got InsNotSupportedError
             #      - on machine two, thomasv got ClaNotSupportedError
-            #      unclear why the different exceptions, ledger_bitcoin version 0.2.1 in both cases
-            _logger.info(
-                f"ledger_bitcoin.createClient() got exc: {e}. falling back to old plugin."
-            )
-            cl = None
-        if isinstance(cl, ledger_bitcoin.client.NewClient):
+            _logger.info(f"ledger GET_VERSION got exc: {e!r}. assuming legacy protocol.")
+
+        if use_new_client:
             return Ledger_Client_New(hid_device, *args, **kwargs)
         else:
             return Ledger_Client_Legacy(hid_device, *args, **kwargs)
@@ -468,6 +512,74 @@ class Ledger_Client_Legacy(Ledger_Client):
         return True
 
     @runs_in_hwd_thread
+    def _get_master_fingerprint_from_device(self) -> Optional[bytes]:
+        """Master key fingerprint via INS_GET_MASTER_FINGERPRINT.
+
+        Returns None if the app predates that instruction (added in 2.4.11).
+        """
+        apdu = bytearray(
+            [BTCHIP_CLA, BTCHIP_INS_GET_MASTER_FINGERPRINT, 0x00, 0x00, 0x00]
+        )
+        try:
+            response = self.dongleObject.dongle.exchange(apdu)
+        except BTChipException as e:
+            if e.sw in SW_UNKNOWN_INSTRUCTION:
+                # app older than 2.4.11. let the caller fall back to deriving m/0'
+                _logger.info(f"no INS_GET_MASTER_FINGERPRINT (sw={e.sw:04x})")
+                return None
+            raise
+        if len(response) < 4:
+            return None
+        return bytes(response[:4])
+
+    @runs_in_hwd_thread
+    def request_root_fingerprint_from_device(self) -> str:
+        # Apps >= 2.4.11 hand out the master fingerprint directly. We must not fall
+        # back to deriving m/0' there: apps >= 2.4.10 refuse to derive the master key.
+        try:
+            fingerprint = self._get_master_fingerprint_from_device()
+            if fingerprint is not None:
+                return fingerprint.hex()
+            return super().request_root_fingerprint_from_device()
+        except BTChipException as e:
+            # this runs for every device we enumerate, so a locked device is common
+            if e.sw == SW_DEVICE_LOCKED:
+                raise UserFacingException(
+                    _("Your Ledger is locked. Please unlock it.")
+                ) from e
+            raise
+
+    @runs_in_hwd_thread
+    def _get_wallet_public_key(self, bip32_path: str) -> dict:
+        """getWalletPublicKey, translating a refused derivation into a clear error."""
+        try:
+            return self.dongleObject.getWalletPublicKey(bip32_path)
+        except BTChipException as e:
+            if e.sw == SW_TECHNICAL_PROBLEM:
+                raise UserFacingException(msg_derivation_refused(bip32_path)) from e
+            if e.sw == SW_DEVICE_LOCKED:
+                raise UserFacingException(
+                    _("Your Ledger is locked. Please unlock it.")
+                ) from e
+            raise
+
+    @runs_in_hwd_thread
+    def get_password_for_storage_encryption(self) -> str:
+        try:
+            return super().get_password_for_storage_encryption()
+        except UserFacingException as e:
+            raise StorageEncryptionUnavailable(
+                str(e)
+                + "\n\n"
+                + _(
+                    "This wallet file is encrypted with your Ledger device, which needs a "
+                    "key outside the paths the {legacy} app allows. Open it with the {new} "
+                    'app selected on the device, then turn off "Encrypt wallet file" in '
+                    "Wallet > Password."
+                ).format(legacy=LEGACY_APP_NAME, new=NEW_APP_NAME)
+            ) from e
+
+    @runs_in_hwd_thread
     @test_pin_unlocked
     def get_xpub(self, bip32_path, xtype):
         self.checkDevice()
@@ -486,14 +598,14 @@ class Ledger_Client_Legacy(Ledger_Client):
         bip32_path = bip32_path[2:]  # cut off "m/"
         if len(bip32_intpath) >= 1:
             prevPath = bip32.convert_bip32_intpath_to_strpath(bip32_intpath[:-1])[2:]
-            nodeData = self.dongleObject.getWalletPublicKey(prevPath)
+            nodeData = self._get_wallet_public_key(prevPath)
             publicKey = compress_public_key(nodeData["publicKey"])
             fingerprint_bytes = hash_160(publicKey)[0:4]
             childnum_bytes = bip32_intpath[-1].to_bytes(length=4, byteorder="big")
         else:
             fingerprint_bytes = bytes(4)
             childnum_bytes = bytes(4)
-        nodeData = self.dongleObject.getWalletPublicKey(bip32_path)
+        nodeData = self._get_wallet_public_key(bip32_path)
         publicKey = compress_public_key(nodeData["publicKey"])
         depth = len(bip32_intpath)
         return BIP32Node(

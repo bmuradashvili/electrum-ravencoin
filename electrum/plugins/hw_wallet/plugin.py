@@ -368,6 +368,14 @@ class LibraryFoundButUnusable(Exception):
         self.library_version = library_version
 
 
+class StorageEncryptionUnavailable(UserFacingException):
+    """The device cannot give us the key that encrypts the wallet file.
+
+    e.g. ledger's bitcoin-fork apps (>= 2.4.10) refuse to derive the path
+    electrum uses for wallet file encryption.
+    """
+
+
 class OutdatedHwFirmwareException(UserFacingException):
 
     def text_ignore_old_fw_and_continue(self) -> str:

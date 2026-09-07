@@ -44,7 +44,8 @@ from .util import UserCancelled, InvalidPassword, WalletFileException, UserFacin
 from .simple_config import SimpleConfig
 from .plugin import Plugins, HardwarePluginLibraryUnavailable
 from .logging import Logger
-from .plugins.hw_wallet.plugin import OutdatedHwFirmwareException, HW_PluginBase
+from .plugins.hw_wallet.plugin import (OutdatedHwFirmwareException, HW_PluginBase,
+                                        StorageEncryptionUnavailable)
 
 if TYPE_CHECKING:
     from .plugin import DeviceInfo, BasePlugin
@@ -629,6 +630,17 @@ class BaseWizard(Logger):
                 devmgr = self.plugins.device_manager
                 devmgr.unpair_pairing_code(k.pairing_code())
                 raise ChooseHwDeviceAgain()
+            except StorageEncryptionUnavailable as e:
+                # the device refuses to derive the key we encrypt the file with.
+                # create the wallet without hw-device storage encryption.
+                self.logger.info(f'hw storage encryption unavailable: {e}')
+                self.show_error(str(e))
+                self.reset_stack()
+                self.on_password(None,
+                                 encrypt_storage=False,
+                                 storage_enc_version=StorageEncryptionVersion.XPUB_PASSWORD,
+                                 encrypt_keystore=False)
+                return
             except BaseException as e:
                 self.logger.exception('')
                 self.show_error(str(e))
